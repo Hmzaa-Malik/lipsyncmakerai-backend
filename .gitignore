@@ -1,6 +1,17 @@
-venv/
+# Python
 __pycache__/
 *.pyc
-storage/
-.env
+venv/
+
+# Runtime data
+uploads/
+input/
+output/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
 .DS_Store
+Thumbs.db
