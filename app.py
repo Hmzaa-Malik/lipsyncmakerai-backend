@@ -1,213 +1,207 @@
-import os
-import time
 import json
+import time
+import uuid
 import shutil
-from pathlib import Path
-from typing import Optional, Dict, Any, List
-
 import requests
+from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
-# =========================
-# CONFIG (edit only paths)
-# =========================
-COMFYUI_URL = os.getenv("COMFYUI_URL", "http://127.0.0.1:8188")
+# ===================== CONFIG =====================
 
-# IMPORTANT: this must be your REAL ComfyUI input folder on Windows
-# Example:
-# C:\Users\arste\AI\ComfyUI Install This\ComfyUI\input
-COMFYUI_INPUT_DIR = Path(os.getenv("COMFYUI_INPUT_DIR", r"C:\Users\arste\AI\ComfyUI Install This\ComfyUI\input"))
+COMFY_URL = "http://192.168.56.1:8188"
 
-WORKFLOW_PATH = Path("workflows/infinite_talk_api.json")
+# Your sanitized workflow (the one you already created)
+WORKFLOW_PATH = Path("Workflows/infinite_talk_api.json")
 
-# Your workflow node IDs (from your screenshots / workflow)
-TEXT_NODE_ID = "135"   # WanVideoTextEncode
-IMAGE_NODE_ID = "133"  # LoadImage
-AUDIO_NODE_ID = "125"  # LoadAudio
+# IMPORTANT: These must match your real ComfyUI folders
+COMFY_INPUT_DIR = Path(r"D:\AI\ComfyUI\input")
+COMFY_OUTPUT_DIR = Path(r"D:\AI\ComfyUI\output")
 
-app = FastAPI(title="LipsyncMakerAI Backend")
+# Backend local folders (optional, but useful)
+BASE_DIR = Path(__file__).parent
+LOCAL_INPUT_DIR = BASE_DIR / "input"
+LOCAL_INPUT_DIR.mkdir(exist_ok=True)
 
-# Allow frontend calls (Next.js / Vercel, local dev, etc.)
+# ===================== APP =====================
+
+app = FastAPI(title="LipsyncMakerAI Backend", version="0.1.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later you can lock this to your domains
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ===================== HELPERS =====================
+
+def safe_name(original: str) -> str:
+    # Avoid spaces and weird chars to keep ComfyUI happy
+    keep = []
+    for ch in original:
+        if ch.isalnum() or ch in ("_", "-", ".",):
+            keep.append(ch)
+        else:
+            keep.append("_")
+    return "".join(keep)
+
+def load_workflow() -> dict:
+    with open(WORKFLOW_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def patch_workflow(wf: dict, image_filename: str, audio_filename: str, text: str):
+    """
+    Your workflow JSON is "nodes/links" style.
+    We patch widget values inside nodes:
+      - LoadImage -> widgets_values[0] = image filename
+      - LoadAudio -> widgets_values[0] = audio filename
+      - WanVideoTextEncode -> widgets_values[0] = text (optional)
+    """
+    for node in wf.get("nodes", []):
+        if node.get("type") == "LoadImage":
+            # widgets_values = [filename, "image"]
+            node["widgets_values"][0] = image_filename
+
+        if node.get("type") == "LoadAudio":
+            # widgets_values = [filename, null, null]
+            node["widgets_values"][0] = audio_filename
+
+        if node.get("type") == "WanVideoTextEncode":
+            if text and isinstance(node.get("widgets_values"), list) and len(node["widgets_values"]) > 0:
+                node["widgets_values"][0] = text
+
+def submit_prompt(workflow_dict: dict) -> str:
+    """
+    ComfyUI expects: {"prompt": <something>}
+    Many builds accept full workflow dict here because ComfyUI custom frontends translate it.
+    If your ComfyUI rejects it later, we will switch to "API prompt format" mapping node IDs.
+    """
+    payload = {
+        "prompt": workflow_dict,
+        "client_id": str(uuid.uuid4())
+    }
+    r = requests.post(f"{COMFY_URL}/prompt", json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()["prompt_id"]
+
+def find_any_mp4(obj):
+    """
+    Walk any nested dict/list and return first filename ending with .mp4
+    Also supports ComfyUI history format where file dict has {"filename": "..."}
+    """
+    if isinstance(obj, dict):
+        # common case: {"filename": "..."}
+        fn = obj.get("filename")
+        if isinstance(fn, str) and fn.lower().endswith(".mp4"):
+            return fn
+
+        for v in obj.values():
+            got = find_any_mp4(v)
+            if got:
+                return got
+
+    if isinstance(obj, list):
+        for item in obj:
+            got = find_any_mp4(item)
+            if got:
+                return got
+
+    if isinstance(obj, str) and obj.lower().endswith(".mp4"):
+        return obj
+
+    return None
+
+def wait_for_video(prompt_id: str, timeout_seconds=1200) -> str:
+    start = time.time()
+    while time.time() - start < timeout_seconds:
+        r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            mp4 = find_any_mp4(data)
+            if mp4:
+                return mp4
+        time.sleep(2)
+    raise TimeoutError("Timed out waiting for MP4 in ComfyUI history")
+
+# ===================== ROUTES =====================
 
 @app.get("/")
 def root():
-    return {"message": "Backend is working"}
+    return {"status": "ok"}
 
-
-def load_api_workflow() -> Dict[str, Any]:
-    """
-    Loads the ComfyUI API-format workflow.
-    If this file is UI-format, ComfyUI will throw 'missing class_type'.
-    """
-    if not WORKFLOW_PATH.exists():
-        raise FileNotFoundError(f"Workflow not found: {WORKFLOW_PATH}")
-
-    wf = json.loads(WORKFLOW_PATH.read_text(encoding="utf-8"))
-
-    # API format usually has: {"prompt": {...}, ...}
-    # Some builds store it directly as the prompt dict itself.
-    if "prompt" in wf:
-        prompt = wf["prompt"]
-    else:
-        prompt = wf
-
-    # quick validation (class_type must exist per node)
-    any_node = next(iter(prompt.values()))
-    if isinstance(any_node, dict) and "class_type" not in any_node:
-        raise ValueError(
-            "Your workflow file is NOT API format.\n"
-            "Please export from ComfyUI using: Save (API Format)\n"
-            "and save as workflows/infinite_talk_api.json"
-        )
-
-    return prompt
-
-
-def copy_to_comfyui_input(upload: UploadFile) -> str:
-    """
-    Copies an uploaded file into ComfyUI input folder and returns the filename.
-    ComfyUI nodes (LoadImage/LoadAudio) usually expect a filename inside input/.
-    """
-    COMFYUI_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Keep original filename but make it safer
-    filename = Path(upload.filename).name
-    dst = COMFYUI_INPUT_DIR / filename
-
-    with dst.open("wb") as f:
-        shutil.copyfileobj(upload.file, f)
-
-    return filename
-
-
-def set_node_input(prompt: Dict[str, Any], node_id: str, key: str, value: Any) -> None:
-    """
-    Safely updates prompt[node_id]["inputs"][key] = value
-    """
-    if node_id not in prompt:
-        raise KeyError(f"Node id {node_id} not found in workflow prompt")
-    node = prompt[node_id]
-    if "inputs" not in node:
-        node["inputs"] = {}
-    node["inputs"][key] = value
-
-
-def queue_prompt_to_comfyui(prompt: Dict[str, Any]) -> str:
-    """
-    POST /prompt -> returns prompt_id
-    """
-    r = requests.post(f"{COMFYUI_URL}/prompt", json={"prompt": prompt}, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-    if "prompt_id" not in data:
-        raise RuntimeError(f"Unexpected ComfyUI response: {data}")
-    return data["prompt_id"]
-
-
-def wait_for_completion(prompt_id: str, timeout_sec: int = 1800) -> Dict[str, Any]:
-    """
-    Poll /history/{prompt_id} until outputs exist or timeout.
-    """
-    start = time.time()
-    while True:
-        if time.time() - start > timeout_sec:
-            raise TimeoutError("ComfyUI job timed out")
-
-        r = requests.get(f"{COMFYUI_URL}/history/{prompt_id}", timeout=30)
-        r.raise_for_status()
-        hist = r.json()
-
-        # When done, ComfyUI returns a dict with prompt_id key and outputs
-        if prompt_id in hist and "outputs" in hist[prompt_id]:
-            return hist[prompt_id]
-
-        time.sleep(2)
-
-
-def extract_output_files(history_item: Dict[str, Any]) -> List[Dict[str, str]]:
-    """
-    Extracts output files from history response.
-    """
-    results = []
-    outputs = history_item.get("outputs", {})
-    for node_id, out in outputs.items():
-        # files are usually under: out["videos"] or out["images"]
-        for key in ["videos", "images", "gifs"]:
-            if key in out:
-                for f in out[key]:
-                    results.append({
-                        "node_id": str(node_id),
-                        "type": key,
-                        "filename": f.get("filename", ""),
-                        "subfolder": f.get("subfolder", ""),
-                        "format": f.get("type", ""),
-                    })
-    return results
-
+@app.get("/health")
+def health():
+    return {"status": "healthy", "comfyui": COMFY_URL}
 
 @app.post("/video")
-def generate_video(
-    text: str = Form(""),
+async def generate_video(
     image: UploadFile = File(...),
     audio: UploadFile = File(...),
+    text: str = Form("")
 ):
-    """
-    Runs InfiniteTalk workflow via ComfyUI API.
-    Requires:
-      - image file
-      - audio file
-      - text (optional, used as positive prompt)
-    """
     try:
-        prompt = load_api_workflow()
+        if not COMFY_INPUT_DIR.exists():
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": f"ComfyUI input folder not found: {COMFY_INPUT_DIR}"}
+            )
 
-        # 1) copy user files into ComfyUI input/
-        image_name = copy_to_comfyui_input(image)
-        audio_name = copy_to_comfyui_input(audio)
+        if not COMFY_OUTPUT_DIR.exists():
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": f"ComfyUI output folder not found: {COMFY_OUTPUT_DIR}"}
+            )
 
-        # 2) set workflow inputs
-        # LoadImage usually uses input key "image"
-        set_node_input(prompt, IMAGE_NODE_ID, "image", image_name)
+        job_id = str(uuid.uuid4())[:8]
 
-        # LoadAudio usually uses input key "audio" (sometimes "audio_file")
-        # If your node fails, we will switch this key to match your API workflow.
-        set_node_input(prompt, AUDIO_NODE_ID, "audio", audio_name)
+        img_name = safe_name(f"{job_id}_{image.filename}")
+        aud_name = safe_name(f"{job_id}_{audio.filename}")
 
-        # WanVideoTextEncode: usually "positive_prompt" or "text" depending on node implementation
-        # Your screenshot shows two boxes; in many builds it's "positive" and "negative".
-        if text.strip():
-            # Try common keys; whichever exists in your workflow will work.
-            # If none exist, we will adjust after you share the API workflow.
-            for k in ["positive", "text", "prompt", "positive_prompt"]:
-                try:
-                    set_node_input(prompt, TEXT_NODE_ID, k, text.strip())
-                    break
-                except Exception:
-                    pass
+        local_img = LOCAL_INPUT_DIR / img_name
+        local_aud = LOCAL_INPUT_DIR / aud_name
 
-        # 3) queue in ComfyUI
-        prompt_id = queue_prompt_to_comfyui(prompt)
+        with open(local_img, "wb") as f:
+            shutil.copyfileobj(image.file, f)
 
-        # 4) wait + return outputs
-        history_item = wait_for_completion(prompt_id)
-        files = extract_output_files(history_item)
+        with open(local_aud, "wb") as f:
+            shutil.copyfileobj(audio.file, f)
+
+        # Copy into ComfyUI input so LoadImage/LoadAudio can see them
+        comfy_img = COMFY_INPUT_DIR / img_name
+        comfy_aud = COMFY_INPUT_DIR / aud_name
+
+        shutil.copy2(local_img, comfy_img)
+        shutil.copy2(local_aud, comfy_aud)
+
+        # Load + patch workflow
+        wf = load_workflow()
+        patch_workflow(wf, img_name, aud_name, text.strip())
+
+        # Submit to ComfyUI
+        prompt_id = submit_prompt(wf)
+
+        # Wait for mp4 name in history
+        video_filename = wait_for_video(prompt_id)
 
         return {
-            "status": "completed",
+            "status": "success",
             "prompt_id": prompt_id,
-            "outputs": files,
-            "note": "If outputs list is empty, we will locate the correct output node in history.",
+            "video": video_filename,
+            "download": f"/output/{video_filename}"
         }
 
     except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
+@app.get("/output/{filename}")
+def get_output(filename: str):
+    fp = COMFY_OUTPUT_DIR / filename
+    if not fp.exists():
+        return JSONResponse(status_code=404, content={"status": "error", "message": "File not found in ComfyUI output"})
+    return FileResponse(fp, media_type="video/mp4", filename=filename)
