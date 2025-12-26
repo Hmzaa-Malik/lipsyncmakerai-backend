@@ -1,31 +1,31 @@
-import json
+import os
 import time
 import uuid
 import shutil
 import requests
-from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse, FileResponse
+from enum import Enum
+from typing import Dict
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# ===================== CONFIG =====================
+# =========================
+# CONFIG
+# =========================
+COMFYUI_URL = os.getenv("COMFYUI_URL", "http://127.0.0.1:8188")
 
-COMFY_URL = "http://192.168.56.1:8188"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+WORKFLOW_PATH = os.path.join(BASE_DIR, "Workflows", "infinite_talk_api.json")
 
-# Your sanitized workflow (the one you already created)
-WORKFLOW_PATH = Path("Workflows/infinite_talk_api.json")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# IMPORTANT: These must match your real ComfyUI folders
-COMFY_INPUT_DIR = Path(r"D:\AI\ComfyUI\input")
-COMFY_OUTPUT_DIR = Path(r"D:\AI\ComfyUI\output")
-
-# Backend local folders (optional, but useful)
-BASE_DIR = Path(__file__).parent
-LOCAL_INPUT_DIR = BASE_DIR / "input"
-LOCAL_INPUT_DIR.mkdir(exist_ok=True)
-
-# ===================== APP =====================
-
+# =========================
+# APP INIT
+# =========================
 app = FastAPI(title="LipsyncMakerAI Backend", version="0.1.0")
 
 app.add_middleware(
@@ -36,172 +36,146 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===================== HELPERS =====================
+# =========================
+# JOB SYSTEM
+# =========================
+class JobStatus(str, Enum):
+    queued = "queued"
+    uploading = "uploading"
+    rendering = "rendering"
+    completed = "completed"
+    failed = "failed"
 
-def safe_name(original: str) -> str:
-    # Avoid spaces and weird chars to keep ComfyUI happy
-    keep = []
-    for ch in original:
-        if ch.isalnum() or ch in ("_", "-", ".",):
-            keep.append(ch)
-        else:
-            keep.append("_")
-    return "".join(keep)
+jobs: Dict[str, dict] = {}
 
-def load_workflow() -> dict:
+# =========================
+# HELPERS
+# =========================
+def save_upload(file: UploadFile) -> str:
+    filename = f"{uuid.uuid4().hex}_{file.filename}"
+    path = os.path.join(UPLOAD_DIR, filename)
+    with open(path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    return path
+
+
+def upload_to_comfyui(file_path: str, file_type: str) -> str:
+    endpoint = f"{COMFYUI_URL}/upload/{file_type}"
+    with open(file_path, "rb") as f:
+        r = requests.post(endpoint, files={"file": f})
+    r.raise_for_status()
+    return r.json()["name"]
+
+
+def load_workflow(image_name: str, audio_name: str, text: str) -> dict:
+    import json
+
     with open(WORKFLOW_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        workflow = json.load(f)
 
-def patch_workflow(wf: dict, image_filename: str, audio_filename: str, text: str):
-    """
-    Your workflow JSON is "nodes/links" style.
-    We patch widget values inside nodes:
-      - LoadImage -> widgets_values[0] = image filename
-      - LoadAudio -> widgets_values[0] = audio filename
-      - WanVideoTextEncode -> widgets_values[0] = text (optional)
-    """
-    for node in wf.get("nodes", []):
-        if node.get("type") == "LoadImage":
-            # widgets_values = [filename, "image"]
-            node["widgets_values"][0] = image_filename
+    for node in workflow["nodes"]:
+        if node["type"] == "LoadImage":
+            node["widgets_values"][0] = image_name
+        if node["type"] == "LoadAudio":
+            node["widgets_values"][0] = audio_name
+        if node["type"] == "WanVideoTextEncode":
+            node["widgets_values"][2] = text or ""
 
-        if node.get("type") == "LoadAudio":
-            # widgets_values = [filename, null, null]
-            node["widgets_values"][0] = audio_filename
+    return workflow
 
-        if node.get("type") == "WanVideoTextEncode":
-            if text and isinstance(node.get("widgets_values"), list) and len(node["widgets_values"]) > 0:
-                node["widgets_values"][0] = text
 
-def submit_prompt(workflow_dict: dict) -> str:
-    """
-    ComfyUI expects: {"prompt": <something>}
-    Many builds accept full workflow dict here because ComfyUI custom frontends translate it.
-    If your ComfyUI rejects it later, we will switch to "API prompt format" mapping node IDs.
-    """
-    payload = {
-        "prompt": workflow_dict,
-        "client_id": str(uuid.uuid4())
-    }
-    r = requests.post(f"{COMFY_URL}/prompt", json=payload, timeout=60)
+def submit_workflow(workflow: dict) -> str:
+    r = requests.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow})
     r.raise_for_status()
     return r.json()["prompt_id"]
 
-def find_any_mp4(obj):
-    """
-    Walk any nested dict/list and return first filename ending with .mp4
-    Also supports ComfyUI history format where file dict has {"filename": "..."}
-    """
-    if isinstance(obj, dict):
-        # common case: {"filename": "..."}
-        fn = obj.get("filename")
-        if isinstance(fn, str) and fn.lower().endswith(".mp4"):
-            return fn
 
-        for v in obj.values():
-            got = find_any_mp4(v)
-            if got:
-                return got
+def wait_for_output(prompt_id: str) -> str:
+    while True:
+        r = requests.get(f"{COMFYUI_URL}/history/{prompt_id}")
+        r.raise_for_status()
+        history = r.json()
 
-    if isinstance(obj, list):
-        for item in obj:
-            got = find_any_mp4(item)
-            if got:
-                return got
+        if prompt_id in history:
+            outputs = history[prompt_id]["outputs"]
+            for node in outputs.values():
+                if "videos" in node:
+                    return node["videos"][0]["filename"]
 
-    if isinstance(obj, str) and obj.lower().endswith(".mp4"):
-        return obj
-
-    return None
-
-def wait_for_video(prompt_id: str, timeout_seconds=1200) -> str:
-    start = time.time()
-    while time.time() - start < timeout_seconds:
-        r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=30)
-        if r.status_code == 200:
-            data = r.json()
-            mp4 = find_any_mp4(data)
-            if mp4:
-                return mp4
         time.sleep(2)
-    raise TimeoutError("Timed out waiting for MP4 in ComfyUI history")
 
-# ===================== ROUTES =====================
-
+# =========================
+# ROUTES
+# =========================
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {"status": "ok", "service": "LipsyncMakerAI Backend"}
+
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "comfyui": COMFY_URL}
+    return {"status": "healthy"}
+
 
 @app.post("/video")
-async def generate_video(
+def generate_video(
     image: UploadFile = File(...),
     audio: UploadFile = File(...),
     text: str = Form("")
 ):
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status": JobStatus.queued,
+        "output": None,
+        "error": None,
+    }
+
     try:
-        if not COMFY_INPUT_DIR.exists():
-            return JSONResponse(
-                status_code=500,
-                content={"status": "error", "message": f"ComfyUI input folder not found: {COMFY_INPUT_DIR}"}
-            )
+        jobs[job_id]["status"] = JobStatus.uploading
 
-        if not COMFY_OUTPUT_DIR.exists():
-            return JSONResponse(
-                status_code=500,
-                content={"status": "error", "message": f"ComfyUI output folder not found: {COMFY_OUTPUT_DIR}"}
-            )
+        image_path = save_upload(image)
+        audio_path = save_upload(audio)
 
-        job_id = str(uuid.uuid4())[:8]
+        image_name = upload_to_comfyui(image_path, "image")
+        audio_name = upload_to_comfyui(audio_path, "audio")
 
-        img_name = safe_name(f"{job_id}_{image.filename}")
-        aud_name = safe_name(f"{job_id}_{audio.filename}")
+        workflow = load_workflow(image_name, audio_name, text)
 
-        local_img = LOCAL_INPUT_DIR / img_name
-        local_aud = LOCAL_INPUT_DIR / aud_name
+        jobs[job_id]["status"] = JobStatus.rendering
 
-        with open(local_img, "wb") as f:
-            shutil.copyfileobj(image.file, f)
+        prompt_id = submit_workflow(workflow)
+        output_filename = wait_for_output(prompt_id)
 
-        with open(local_aud, "wb") as f:
-            shutil.copyfileobj(audio.file, f)
-
-        # Copy into ComfyUI input so LoadImage/LoadAudio can see them
-        comfy_img = COMFY_INPUT_DIR / img_name
-        comfy_aud = COMFY_INPUT_DIR / aud_name
-
-        shutil.copy2(local_img, comfy_img)
-        shutil.copy2(local_aud, comfy_aud)
-
-        # Load + patch workflow
-        wf = load_workflow()
-        patch_workflow(wf, img_name, aud_name, text.strip())
-
-        # Submit to ComfyUI
-        prompt_id = submit_prompt(wf)
-
-        # Wait for mp4 name in history
-        video_filename = wait_for_video(prompt_id)
+        jobs[job_id]["status"] = JobStatus.completed
+        jobs[job_id]["output"] = output_filename
 
         return {
-            "status": "success",
-            "prompt_id": prompt_id,
-            "video": video_filename,
-            "download": f"/output/{video_filename}"
+            "job_id": job_id,
+            "status": jobs[job_id]["status"]
         }
 
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)}
-        )
+        jobs[job_id]["status"] = JobStatus.failed
+        jobs[job_id]["error"] = str(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/job/{job_id}")
+def get_job(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return {
+        "job_id": job_id,
+        "status": jobs[job_id]["status"],
+        "output": jobs[job_id]["output"],
+        "error": jobs[job_id]["error"],
+    }
+
 
 @app.get("/output/{filename}")
 def get_output(filename: str):
-    fp = COMFY_OUTPUT_DIR / filename
-    if not fp.exists():
-        return JSONResponse(status_code=404, content={"status": "error", "message": "File not found in ComfyUI output"})
-    return FileResponse(fp, media_type="video/mp4", filename=filename)
+    path = os.path.join(OUTPUT_DIR, filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, media_type="video/mp4")
